@@ -8,11 +8,27 @@ case, use the [prebuilt server] (so you will not need Java or the Android SDK).
 
 [prebuilt server]: #prebuilt-server
 
+## Branches
+
+### `master`
+
+The `master` branch concerns the latest release, and is the home page of the
+project on Github.
+
+
+### `dev`
+
+`dev` is the current development branch. Every commit present in `dev` will be
+in the next release.
+
+If you want to contribute code, please base your commits on the latest `dev`
+branch.
+
 
 ## Requirements
 
 You need [adb]. It is available in the [Android SDK platform
-tools][platform-tools], or packaged in your distribution (`android-adb-tools`).
+tools][platform-tools], or packaged in your distribution (`adb`).
 
 On Windows, download the [platform-tools][platform-tools-windows] and extract
 the following files to a directory accessible from your `PATH`:
@@ -40,10 +56,10 @@ Install the required packages from your package manager.
 
 ```bash
 # runtime dependencies
-sudo apt install ffmpeg libsdl2-2.0.0
+sudo apt install ffmpeg libsdl2-2.0-0 adb
 
 # client build dependencies
-sudo apt install make gcc pkg-config meson ninja-build \
+sudo apt install gcc git pkg-config meson ninja-build \
                  libavcodec-dev libavformat-dev libavutil-dev \
                  libsdl2-dev
 
@@ -70,7 +86,7 @@ sudo dnf install https://download1.rpmfusion.org/free/fedora/rpmfusion-free-rele
 sudo dnf install SDL2-devel ffms2-devel meson gcc make
 
 # server build dependencies
-sudo dnf install java
+sudo dnf install java-devel
 ```
 
 
@@ -195,8 +211,7 @@ Then, build:
 
 ```bash
 meson x --buildtype release --strip -Db_lto=true
-cd x
-ninja
+ninja -Cx
 ```
 
 _Note: `ninja` [must][ninja-user] be run as a non-root user (only `ninja
@@ -219,13 +234,13 @@ To run without installing:
 After a successful build, you can install _scrcpy_ on the system:
 
 ```bash
-sudo ninja install    # without sudo on Windows
+sudo ninja -Cx install    # without sudo on Windows
 ```
 
 This installs two files:
 
  - `/usr/local/bin/scrcpy`
- - `/usr/local/share/scrcpy/scrcpy-server.jar`
+ - `/usr/local/share/scrcpy/scrcpy-server`
 
 Just remove them to "uninstall" the application.
 
@@ -234,18 +249,20 @@ You can then [run](README.md#run) _scrcpy_.
 
 ## Prebuilt server
 
- - [`scrcpy-server-v1.8.jar`][direct-scrcpy-server]  
-   _(SHA-256: 839055ef905903bf98ead1b9b8a127fe402b39ad657a81f9a914b2dbcb2ce5c0)_
+ - [`scrcpy-server-v1.12.1`][direct-scrcpy-server]  
+   _(SHA-256: 63e569c8a1d0c1df31d48c4214871c479a601782945fed50c1e61167d78266ea)_
 
-[direct-scrcpy-server]: https://github.com/Genymobile/scrcpy/releases/download/v1.8/scrcpy-server-v1.8.jar
+[direct-scrcpy-server]: https://github.com/Genymobile/scrcpy/releases/download/v1.12.1/scrcpy-server-v1.12.1
 
 Download the prebuilt server somewhere, and specify its path during the Meson
 configuration:
 
 ```bash
 meson x --buildtype release --strip -Db_lto=true \
-    -Dprebuilt_server=/path/to/scrcpy-server.jar
-cd x
-ninja
-sudo ninja install
+    -Dprebuilt_server=/path/to/scrcpy-server
+ninja -Cx
+sudo ninja -Cx install
 ```
+
+The server only works with a matching client version (this server works with the
+`master` branch).

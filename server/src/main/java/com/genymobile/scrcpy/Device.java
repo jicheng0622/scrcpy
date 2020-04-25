@@ -1,15 +1,20 @@
 package com.genymobile.scrcpy;
 
 import com.genymobile.scrcpy.wrappers.ServiceManager;
+import com.genymobile.scrcpy.wrappers.SurfaceControl;
+import com.genymobile.scrcpy.wrappers.WindowManager;
 
-import android.graphics.Point;
 import android.graphics.Rect;
 import android.os.Build;
+import android.os.IBinder;
 import android.os.RemoteException;
 import android.view.IRotationWatcher;
 import android.view.InputEvent;
 
 public final class Device {
+
+    public static final int POWER_MODE_OFF = SurfaceControl.POWER_MODE_OFF;
+    public static final int POWER_MODE_NORMAL = SurfaceControl.POWER_MODE_NORMAL;
 
     public interface RotationListener {
         void onRotationChanged(int rotation);
@@ -107,8 +112,8 @@ public final class Device {
         }
         Rect contentRect = screenInfo.getContentRect();
         Point point = position.getPoint();
-        int scaledX = contentRect.left + point.x * contentRect.width() / videoSize.getWidth();
-        int scaledY = contentRect.top + point.y * contentRect.height() / videoSize.getHeight();
+        int scaledX = contentRect.left + point.getX() * contentRect.width() / videoSize.getWidth();
+        int scaledY = contentRect.top + point.getY() * contentRect.height() / videoSize.getHeight();
         return new Point(scaledX, scaledY);
     }
 
@@ -138,6 +143,53 @@ public final class Device {
 
     public void collapsePanels() {
         serviceManager.getStatusBarManager().collapsePanels();
+    }
+
+    public String getClipboardText() {
+        CharSequence s = serviceManager.getClipboardManager().getText();
+        if (s == null) {
+            return null;
+        }
+        return s.toString();
+    }
+
+    public void setClipboardText(String text) {
+        serviceManager.getClipboardManager().setText(text);
+        Ln.i("Device clipboard set");
+    }
+
+    /**
+     * @param mode one of the {@code SCREEN_POWER_MODE_*} constants
+     */
+    public void setScreenPowerMode(int mode) {
+        IBinder d = SurfaceControl.getBuiltInDisplay();
+        if (d == null) {
+            Ln.e("Could not get built-in display");
+            return;
+        }
+        SurfaceControl.setDisplayPowerMode(d, mode);
+        Ln.i("Device screen turned " + (mode == Device.POWER_MODE_OFF ? "off" : "on"));
+    }
+
+    /**
+     * Disable auto-rotation (if enabled), set the screen rotation and re-enable auto-rotation (if it was enabled).
+     */
+    public void rotateDevice() {
+        WindowManager wm = serviceManager.getWindowManager();
+
+        boolean accelerometerRotation = !wm.isRotationFrozen();
+
+        int currentRotation = wm.getRotation();
+        int newRotation = (currentRotation & 1) ^ 1; // 0->1, 1->0, 2->1, 3->0
+        String newRotationString = newRotation == 0 ? "portrait" : "landscape";
+
+        Ln.i("Device rotation requested: " + newRotationString);
+        wm.freezeRotation(newRotation);
+
+        // restore auto-rotate if necessary
+        if (accelerometerRotation) {
+            wm.thawRotation();
+        }
     }
 
     static Rect flipRect(Rect crop) {

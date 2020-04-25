@@ -1,6 +1,8 @@
 package com.genymobile.scrcpy;
 
 import android.graphics.Rect;
+import android.media.MediaCodec;
+import android.os.Build;
 
 import java.io.File;
 import java.io.IOException;
@@ -17,14 +19,19 @@ public final class Server {
         final Device device = new Device(options);
         boolean tunnelForward = options.isTunnelForward();
         try (DesktopConnection connection = DesktopConnection.open(device, tunnelForward)) {
-            ScreenEncoder screenEncoder = new ScreenEncoder(options.getSendFrameMeta(), options.getBitRate());
+            ScreenEncoder screenEncoder = new ScreenEncoder(options.getSendFrameMeta(), options.getBitRate(), options.getMaxFps());
 
-            // asynchronous
-            startEventController(device, connection);
+            if (options.getControl()) {
+                Controller controller = new Controller(device, connection);
+
+                // asynchronous
+                startController(controller);
+                startDeviceMessageSender(controller.getSender());
+            }
 
             try {
                 // synchronous
-                screenEncoder.streamScreen(device, connection.getFd());
+                screenEncoder.streamScreen(device, connection.getVideoFd());
             } catch (IOException e) {
                 // this is expected on close
                 Ln.d("Screen streaming stopped");
@@ -32,15 +39,29 @@ public final class Server {
         }
     }
 
-    private static void startEventController(final Device device, final DesktopConnection connection) {
+    private static void startController(final Controller controller) {
         new Thread(new Runnable() {
             @Override
             public void run() {
                 try {
-                    new EventController(device, connection).control();
+                    controller.control();
                 } catch (IOException e) {
                     // this is expected on close
-                    Ln.d("Event controller stopped");
+                    Ln.d("Controller stopped");
+                }
+            }
+        }).start();
+    }
+
+    private static void startDeviceMessageSender(final DeviceMessageSender sender) {
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    sender.loop();
+                } catch (IOException | InterruptedException e) {
+                    // this is expected on close
+                    Ln.d("Device message sender stopped");
                 }
             }
         }).start();
@@ -48,27 +69,43 @@ public final class Server {
 
     @SuppressWarnings("checkstyle:MagicNumber")
     private static Options createOptions(String... args) {
-        if (args.length != 5) {
-            throw new IllegalArgumentException("Expecting 5 parameters");
+        if (args.length < 1) {
+            throw new IllegalArgumentException("Missing client version");
+        }
+
+        String clientVersion = args[0];
+        if (!clientVersion.equals(BuildConfig.VERSION_NAME)) {
+            throw new IllegalArgumentException(
+                    "The server version (" + clientVersion + ") does not match the client " + "(" + BuildConfig.VERSION_NAME + ")");
+        }
+
+        if (args.length != 8) {
+            throw new IllegalArgumentException("Expecting 8 parameters");
         }
 
         Options options = new Options();
 
-        int maxSize = Integer.parseInt(args[0]) & ~7; // multiple of 8
+        int maxSize = Integer.parseInt(args[1]) & ~7; // multiple of 8
         options.setMaxSize(maxSize);
 
-        int bitRate = Integer.parseInt(args[1]);
+        int bitRate = Integer.parseInt(args[2]);
         options.setBitRate(bitRate);
 
+        int maxFps = Integer.parseInt(args[3]);
+        options.setMaxFps(maxFps);
+
         // use "adb forward" instead of "adb tunnel"? (so the server must listen)
-        boolean tunnelForward = Boolean.parseBoolean(args[2]);
+        boolean tunnelForward = Boolean.parseBoolean(args[4]);
         options.setTunnelForward(tunnelForward);
 
-        Rect crop = parseCrop(args[3]);
+        Rect crop = parseCrop(args[5]);
         options.setCrop(crop);
 
-        boolean sendFrameMeta = Boolean.parseBoolean(args[4]);
+        boolean sendFrameMeta = Boolean.parseBoolean(args[6]);
         options.setSendFrameMeta(sendFrameMeta);
+
+        boolean control = Boolean.parseBoolean(args[7]);
+        options.setControl(control);
 
         return options;
     }
@@ -94,7 +131,21 @@ public final class Server {
         try {
             new File(SERVER_PATH).delete();
         } catch (Exception e) {
-            Ln.e("Cannot unlink server", e);
+            Ln.e("Could not unlink server", e);
+        }
+    }
+
+    @SuppressWarnings("checkstyle:MagicNumber")
+    private static void suggestFix(Throwable e) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            if (e instanceof MediaCodec.CodecException) {
+                MediaCodec.CodecException mce = (MediaCodec.CodecException) e;
+                if (mce.getErrorCode() == 0xfffffc0e) {
+                    Ln.e("The hardware encoder is not able to encode at the given definition.");
+                    Ln.e("Try with a lower definition:");
+                    Ln.e("    scrcpy -m 1024");
+                }
+            }
         }
     }
 
@@ -103,6 +154,7 @@ public final class Server {
             @Override
             public void uncaughtException(Thread t, Throwable e) {
                 Ln.e("Exception on thread " + t, e);
+                suggestFix(e);
             }
         });
 

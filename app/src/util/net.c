@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 
+#include "config.h"
 #include "log.h"
 
 #ifdef __WINDOWS__
@@ -33,6 +34,7 @@ net_connect(uint32_t addr, uint16_t port) {
 
     if (connect(sock, (SOCKADDR *) &sin, sizeof(sin)) == SOCKET_ERROR) {
         perror("connect");
+        net_close(sock);
         return INVALID_SOCKET;
     }
 
@@ -60,11 +62,13 @@ net_listen(uint32_t addr, uint16_t port, int backlog) {
 
     if (bind(sock, (SOCKADDR *) &sin, sizeof(sin)) == SOCKET_ERROR) {
         perror("bind");
+        net_close(sock);
         return INVALID_SOCKET;
     }
 
     if (listen(sock, backlog) == SOCKET_ERROR) {
         perror("listen");
+        net_close(sock);
         return INVALID_SOCKET;
     }
 

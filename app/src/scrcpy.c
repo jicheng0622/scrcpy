@@ -7,6 +7,7 @@
 #include <sys/time.h>
 #include <SDL2/SDL.h>
 
+#include "config.h"
 #include "command.h"
 #include "common.h"
 #include "compat.h"
@@ -17,18 +18,19 @@
 #include "file_handler.h"
 #include "fps_counter.h"
 #include "input_manager.h"
-#include "log.h"
-#include "lock_util.h"
-#include "net.h"
 #include "recorder.h"
 #include "screen.h"
 #include "server.h"
 #include "stream.h"
 #include "tiny_xpm.h"
 #include "video_buffer.h"
+#include "util/lock.h"
+#include "util/log.h"
+#include "util/net.h"
 
 static struct server server = SERVER_INITIALIZER;
 static struct screen screen = SCREEN_INITIALIZER;
+static struct fps_counter fps_counter;
 static struct video_buffer video_buffer;
 static struct stream stream;
 static struct decoder decoder;
@@ -40,6 +42,7 @@ static struct input_manager input_manager = {
     .controller = &controller,
     .video_buffer = &video_buffer,
     .screen = &screen,
+    .prefer_text = false, // initialized later
 };
 
 // init SDL and set appropriate hints
@@ -76,6 +79,11 @@ sdl_init_and_configure(bool display) {
     }
 #endif
 
+    // Do not minimize on focus loss
+    if (!SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0")) {
+        LOGW("Could not disable minimize on focus loss");
+    }
+
     // Do not disable the screensaver when scrcpy is running
     SDL_EnableScreenSaver();
 
@@ -95,6 +103,7 @@ sdl_init_and_configure(bool display) {
 // <https://stackoverflow.com/a/40693139/1987178>
 static int
 event_watcher(void *data, SDL_Event *event) {
+    (void) data;
     if (event->type == SDL_WINDOWEVENT
             && event->window.event == SDL_WINDOWEVENT_RESIZED) {
         // called from another thread, not very safe, but it's a workaround!
@@ -132,16 +141,11 @@ handle_event(SDL_Event *event, bool control) {
                 screen_show_window(&screen);
             }
             if (!screen_update_frame(&screen, &video_buffer)) {
-                return false;
+                return EVENT_RESULT_CONTINUE;
             }
             break;
         case SDL_WINDOWEVENT:
-            switch (event->window.event) {
-                case SDL_WINDOWEVENT_EXPOSED:
-                case SDL_WINDOWEVENT_SIZE_CHANGED:
-                    screen_render(&screen);
-                    break;
-            }
+            screen_handle_window_event(&screen, &event->window);
             break;
         case SDL_TEXTINPUT:
             if (!control) {
@@ -174,6 +178,11 @@ handle_event(SDL_Event *event, bool control) {
             input_manager_process_mouse_button(&input_manager, &event->button,
                                                control);
             break;
+        case SDL_FINGERMOTION:
+        case SDL_FINGERDOWN:
+        case SDL_FINGERUP:
+            input_manager_process_touch(&input_manager, &event->tfinger);
+            break;
         case SDL_DROPFILE: {
             if (!control) {
                 break;
@@ -193,6 +202,7 @@ handle_event(SDL_Event *event, bool control) {
 
 static bool
 event_loop(bool display, bool control) {
+    (void) display;
 #ifdef CONTINUOUS_RESIZING_WORKAROUND
     if (display) {
         SDL_AddEventWatch(event_watcher, NULL);
@@ -205,6 +215,7 @@ event_loop(bool display, bool control) {
             case EVENT_RESULT_STOPPED_BY_USER:
                 return true;
             case EVENT_RESULT_STOPPED_BY_EOS:
+                LOGW("Device disconnected");
                 return false;
             case EVENT_RESULT_CONTINUE:
                 break;
@@ -247,13 +258,14 @@ sdl_priority_from_av_level(int level) {
 
 static void
 av_log_callback(void *avcl, int level, const char *fmt, va_list vl) {
+    (void) avcl;
     SDL_LogPriority priority = sdl_priority_from_av_level(level);
     if (priority == 0) {
         return;
     }
     char *local_fmt = SDL_malloc(strlen(fmt) + 10);
     if (!local_fmt) {
-        LOGC("Cannot allocate string");
+        LOGC("Could not allocate string");
         return;
     }
     // strcpy is safe here, the destination is large enough
@@ -266,9 +278,15 @@ av_log_callback(void *avcl, int level, const char *fmt, va_list vl) {
 bool
 scrcpy(const struct scrcpy_options *options) {
     bool record = !!options->record_filename;
-    if (!server_start(&server, options->serial, options->port,
-                      options->max_size, options->bit_rate, options->crop,
-                      record)) {
+    struct server_params params = {
+        .crop = options->crop,
+        .local_port = options->port,
+        .max_size = options->max_size,
+        .bit_rate = options->bit_rate,
+        .max_fps = options->max_fps,
+        .control = options->control,
+    };
+    if (!server_start(&server, options->serial, &params)) {
         return false;
     }
 
@@ -280,21 +298,22 @@ scrcpy(const struct scrcpy_options *options) {
         show_touches_waited = false;
     }
 
-    bool ret = true;
+    bool ret = false;
 
-    bool display = !options->no_display;
-    bool control = !options->no_control;
+    bool fps_counter_initialized = false;
+    bool video_buffer_initialized = false;
+    bool file_handler_initialized = false;
+    bool recorder_initialized = false;
+    bool stream_started = false;
+    bool controller_initialized = false;
+    bool controller_started = false;
 
-    if (!sdl_init_and_configure(display)) {
-        ret = false;
-        goto finally_destroy_server;
+    if (!sdl_init_and_configure(options->display)) {
+        goto end;
     }
 
-    socket_t device_socket = server_connect_to(&server);
-    if (device_socket == INVALID_SOCKET) {
-        server_stop(&server);
-        ret = false;
-        goto finally_destroy_server;
+    if (!server_connect_to(&server)) {
+        goto end;
     }
 
     char device_name[DEVICE_NAME_FIELD_LENGTH];
@@ -303,24 +322,29 @@ scrcpy(const struct scrcpy_options *options) {
     // screenrecord does not send frames when the screen content does not
     // change therefore, we transmit the screen size before the video stream,
     // to be able to init the window immediately
-    if (!device_read_info(device_socket, device_name, &frame_size)) {
-        server_stop(&server);
-        ret = false;
-        goto finally_destroy_server;
+    if (!device_read_info(server.video_socket, device_name, &frame_size)) {
+        goto end;
     }
 
     struct decoder *dec = NULL;
-    if (display) {
-        if (!video_buffer_init(&video_buffer)) {
-            server_stop(&server);
-            ret = false;
-            goto finally_destroy_server;
+    if (options->display) {
+        if (!fps_counter_init(&fps_counter)) {
+            goto end;
         }
+        fps_counter_initialized = true;
 
-        if (control && !file_handler_init(&file_handler, server.serial)) {
-            ret = false;
-            server_stop(&server);
-            goto finally_destroy_video_buffer;
+        if (!video_buffer_init(&video_buffer, &fps_counter,
+                               options->render_expired_frames)) {
+            goto end;
+        }
+        video_buffer_initialized = true;
+
+        if (options->control) {
+            if (!file_handler_init(&file_handler, server.serial,
+                                   options->push_target)) {
+                goto end;
+            }
+            file_handler_initialized = true;
         }
 
         decoder_init(&decoder, &video_buffer);
@@ -333,42 +357,55 @@ scrcpy(const struct scrcpy_options *options) {
                            options->record_filename,
                            options->record_format,
                            frame_size)) {
-            ret = false;
-            server_stop(&server);
-            goto finally_destroy_file_handler;
+            goto end;
         }
         rec = &recorder;
+        recorder_initialized = true;
     }
 
     av_log_set_callback(av_log_callback);
 
-    stream_init(&stream, device_socket, dec, rec);
+    stream_init(&stream, server.video_socket, dec, rec);
 
     // now we consumed the header values, the socket receives the video stream
     // start the stream
     if (!stream_start(&stream)) {
-        ret = false;
-        server_stop(&server);
-        goto finally_destroy_recorder;
+        goto end;
     }
+    stream_started = true;
 
-    if (display) {
-        if (control) {
-            if (!controller_init(&controller, device_socket)) {
-                ret = false;
-                goto finally_stop_stream;
+    if (options->display) {
+        if (options->control) {
+            if (!controller_init(&controller, server.control_socket)) {
+                goto end;
             }
+            controller_initialized = true;
 
             if (!controller_start(&controller)) {
-                ret = false;
-                goto finally_destroy_controller;
+                goto end;
             }
+            controller_started = true;
         }
 
-        if (!screen_init_rendering(&screen, device_name, frame_size,
-                                   options->always_on_top)) {
-            ret = false;
-            goto finally_stop_and_join_controller;
+        const char *window_title =
+            options->window_title ? options->window_title : device_name;
+
+        if (!screen_init_rendering(&screen, window_title, frame_size,
+                                   options->always_on_top, options->window_x,
+                                   options->window_y, options->window_width,
+                                   options->window_height,
+                                   options->window_borderless)) {
+            goto end;
+        }
+
+        if (options->turn_screen_off) {
+            struct control_msg msg;
+            msg.type = CONTROL_MSG_TYPE_SET_SCREEN_POWER_MODE;
+            msg.set_screen_power_mode.mode = SCREEN_POWER_MODE_OFF;
+
+            if (!controller_push_msg(&controller, &msg)) {
+                LOGW("Could not request 'set screen power mode'");
+            }
         }
 
         if (options->fullscreen) {
@@ -381,48 +418,69 @@ scrcpy(const struct scrcpy_options *options) {
         show_touches_waited = true;
     }
 
-    ret = event_loop(display, control);
+    input_manager.prefer_text = options->prefer_text;
+
+    ret = event_loop(options->display, options->control);
     LOGD("quit...");
 
     screen_destroy(&screen);
 
-finally_stop_and_join_controller:
-    if (display && control) {
+end:
+    // stop stream and controller so that they don't continue once their socket
+    // is shutdown
+    if (stream_started) {
+        stream_stop(&stream);
+    }
+    if (controller_started) {
         controller_stop(&controller);
+    }
+    if (file_handler_initialized) {
+        file_handler_stop(&file_handler);
+    }
+    if (fps_counter_initialized) {
+        fps_counter_interrupt(&fps_counter);
+    }
+
+    // shutdown the sockets and kill the server
+    server_stop(&server);
+
+    // now that the sockets are shutdown, the stream and controller are
+    // interrupted, we can join them
+    if (stream_started) {
+        stream_join(&stream);
+    }
+    if (controller_started) {
         controller_join(&controller);
     }
-finally_destroy_controller:
-    if (display && control) {
+    if (controller_initialized) {
         controller_destroy(&controller);
     }
-finally_stop_stream:
-    stream_stop(&stream);
-    // stop the server before stream_join() to wake up the stream
-    server_stop(&server);
-    stream_join(&stream);
-finally_destroy_recorder:
-    if (record) {
+
+    if (recorder_initialized) {
         recorder_destroy(&recorder);
     }
-finally_destroy_file_handler:
-    if (display && control) {
-        file_handler_stop(&file_handler);
+
+    if (file_handler_initialized) {
         file_handler_join(&file_handler);
         file_handler_destroy(&file_handler);
     }
-finally_destroy_video_buffer:
-    if (display) {
+
+    if (video_buffer_initialized) {
         video_buffer_destroy(&video_buffer);
     }
-finally_destroy_server:
+
+    if (fps_counter_initialized) {
+        fps_counter_join(&fps_counter);
+        fps_counter_destroy(&fps_counter);
+    }
+
     if (options->show_touches) {
         if (!show_touches_waited) {
             // wait the process which enabled "show touches"
             wait_show_touches(proc_show_touches);
         }
         LOGI("Disable show_touches");
-        proc_show_touches = set_show_touches_enabled(options->serial,
-                                                     false);
+        proc_show_touches = set_show_touches_enabled(options->serial, false);
         wait_show_touches(proc_show_touches);
     }
 
